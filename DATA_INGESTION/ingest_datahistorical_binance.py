@@ -5,6 +5,9 @@ import zipfile
 import io
 import os
 from datetime import datetime
+import warnings
+
+warnings.filterwarnings("ignore")
 
 # ==============================================================================
 # 1. PENGUNDUH DATA HISTORIS (BINANCE VISION)
@@ -12,7 +15,7 @@ from datetime import datetime
 def download_binance_vision_zip(url: str, col_names: list) -> pd.DataFrame:
     """Mengunduh file ZIP CSV dari Binance Vision, mengekstrak ke memory, dan me-load ke Pandas."""
     print(f"Mengunduh: {url.split('/')[-1]}...")
-    response = requests.get(url)
+    response = requests.get(url, timeout=30)
     if response.status_code != 200:
         print(f"File tidak ditemukan (404) untuk URL: {url}")
         return pd.DataFrame()
@@ -22,7 +25,7 @@ def download_binance_vision_zip(url: str, col_names: list) -> pd.DataFrame:
         with z.open(csv_filename) as f:
             df = pd.read_csv(f, header=None, low_memory=False)
             
-            # Deteksi otomatis: Jika baris pertama bukan angka (mengandung huruf/header), buang baris tersebut
+            # Deteksi otomatis header
             first_val = str(df.iloc[0, 0])
             if not first_val.replace('.', '', 1).isdigit():
                 df = df.iloc[1:].reset_index(drop=True)
@@ -41,7 +44,7 @@ def fetch_historical_month(symbol: str, year: int, month: int) -> pd.DataFrame:
     
     prem_url = f"https://data.binance.vision/data/futures/um/monthly/premiumIndexKlines/{symbol}/1m/{symbol}-1m-{year}-{month_str}.zip"
     prem_cols = ["open_time", "open_prem", "high_prem", "low_prem", "close_prem", "vol_prem", 
-                 "close_time_prem", "quote_vol_prem", "count_prem", "taker_base_prem", "taker_quote_prem", "ignore_prem"]
+                  "close_time_prem", "quote_vol_prem", "count_prem", "taker_base_prem", "taker_quote_prem", "ignore_prem"]
     df_prem = download_binance_vision_zip(prem_url, prem_cols)
 
     if df_kline.empty:
@@ -65,20 +68,30 @@ def fetch_historical_month(symbol: str, year: int, month: int) -> pd.DataFrame:
     return df_kline
 
 # ==============================================================================
-# 2. FEATURE ENGINEERING & 5-MIN TARGET (THE FINAL 13)
+# 2. FEATURE ENGINEERING (PASANGAN FITUR LENGKAP + TARGET 3-KELAS ANTI-NOISE)
 # ==============================================================================
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    print("Memproses Feature Engineering & Target 5-Menit (Stasioner)...")
+    print("Memproses Feature Engineering (Pasangan Simetris Utuh & Target 3-Kelas Cost-Aware)...")
     eps = 1e-8
     
-    # 0. Patch Data Kosong Premium Index dengan Forward Fill
     df["premium_index_bps"] = df["premium_index_bps"].ffill().fillna(0.0)
+    log_ret_1m = np.log(df["close"] / df["close"].shift(1)).fillna(0.0)
     
-    # 1. Geometri Candle (Hanya Lower Wick Ratio yang lolos audit)
+    # --------------------------------------------------------------------------
+    # 1. GEOMETRI CANDLE BERPASANGAN (Mendeteksi Bullish & Bearish Sweep Seimbang)
+    # --------------------------------------------------------------------------
     candle_range = (df["high"] - df["low"]) + eps
     df["lower_wick_ratio"] = (np.minimum(df["open"], df["close"]) - df["low"]) / candle_range
+    df["upper_wick_ratio"] = (df["high"] - np.maximum(df["open"], df["close"])) / candle_range
     
-    # 2. Volatilitas (Normalized ATR dalam Basis Points)
+    # Gabungan simetris (-1.0 = Bearish Upper Sweep, +1.0 = Bullish Lower Sweep)
+    df["wick_imbalance"] = df["lower_wick_ratio"] - df["upper_wick_ratio"]
+    # Close Location Value (-1.0 = Tutup di Low, +1.0 = Tutup di High)
+    df["clv_imbalance"] = ((df["close"] - df["low"]) - (df["high"] - df["close"])) / candle_range
+    
+    # --------------------------------------------------------------------------
+    # 2. VOLATILITAS STASIONER (Parkinson Ratio & NATR Basis Points)
+    # --------------------------------------------------------------------------
     prev_c = df["close"].shift(1)
     tr = np.maximum(df["high"] - df["low"], np.maximum((df["high"] - prev_c).abs(), (df["low"] - prev_c).abs()))
     atr_1m = tr.ewm(span=14, adjust=False).mean().bfill()
@@ -89,37 +102,115 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     park_60m = np.sqrt(hl_sq.rolling(60, min_periods=10).mean() / (4.0 * np.log(2.0))) + eps
     df["volatility_ratio_5m_60m"] = (park_5m / park_60m).fillna(1.0)
     
-    # 3. VWAP Z-Score 4H (Raja Fitur)
+    # --------------------------------------------------------------------------
+    # 3. VWAP Z-SCORE 4H (Core Mean-Reversion Anchor)
+    # --------------------------------------------------------------------------
     typ_price = (df["high"] + df["low"] + df["close"]) / 3.0
-    vwap_4h = (typ_price * df["total_volume"]).rolling(240, min_periods=15).sum() / (df["total_volume"].rolling(240, min_periods=15).sum() + eps)
+    vwap_4h = (typ_price * df["total_volume"]).rolling(240, min_periods=15).sum() / (
+        df["total_volume"].rolling(240, min_periods=15).sum() + eps
+    )
     df["vwap_zscore_4h"] = ((df["close"] - vwap_4h) / (df["close"].rolling(240, min_periods=15).std() + eps)).fillna(0.0)
     
-    # 4. Agresi Order Flow
+    # --------------------------------------------------------------------------
+    # 4. AGRESI ORDER FLOW + FITUR ORTOGONAL (Bebas Bias Return Masa Lalu)
+    # --------------------------------------------------------------------------
     df["volume_delta_lag1"] = df["volume_delta"].shift(1).fillna(0.0)
+    
+    # Rasio Taker Imbalance Stasioner (-1.0 s/d +1.0, bebas bias jumlah BTC tahun 2021 vs 2026)
+    df["taker_imbalance_ratio"] = (df["volume_delta"] / (df["total_volume"] + eps)).clip(-1.0, 1.0)
+    df["taker_imbalance_lag1"] = df["taker_imbalance_ratio"].shift(1).fillna(0.0)
+    
     cvd_30m = df["volume_delta"].rolling(30, min_periods=5).sum()
-    df["cvd_zscore_30m"] = ((cvd_30m - cvd_30m.rolling(60).mean()) / (cvd_30m.rolling(60).std() + eps)).fillna(0.0)
+    df["cvd_zscore_30m"] = ((cvd_30m - cvd_30m.rolling(60, min_periods=10).mean()) / (cvd_30m.rolling(60, min_periods=10).std() + eps)).fillna(0.0)
     
-    # 5. Derivatif Stasioner
-    df["premium_zscore_60m"] = ((df["premium_index_bps"] - df["premium_index_bps"].rolling(60).mean()) / (df["premium_index_bps"].rolling(60).std() + eps)).fillna(0.0)
+    # Flow-Price Divergence (Orderbook Absorption Murni: Lolos uji info_di_luar_return_lalu!)
+    vd_z = (df["volume_delta"] - df["volume_delta"].rolling(60, min_periods=10).mean()) / (df["volume_delta"].rolling(60, min_periods=10).std() + eps)
+    ret_z = (log_ret_1m - log_ret_1m.rolling(60, min_periods=10).mean()) / (log_ret_1m.rolling(60, min_periods=10).std() + eps)
+    df["flow_price_divergence"] = (vd_z - ret_z).fillna(0.0).clip(-5.0, 5.0)
     
-    # 6. Siklus Waktu Trigonometri
-    hour_f = df.index.hour + (df.index.minute / 60.0)
-    df["hour_sin"] = np.sin(2 * np.pi * hour_f / 24.0)
-    df["hour_cos"] = np.cos(2 * np.pi * hour_f / 24.0)
-    df["min_sin"] = np.sin(2 * np.pi * df.index.minute / 60.0)
-    df["min_cos"] = np.cos(2 * np.pi * df.index.minute / 60.0)
+    # --------------------------------------------------------------------------
+    # 5. DERIVATIF STASIONER (Basis Perpetual vs Spot)
+    # --------------------------------------------------------------------------
+    df["premium_zscore_60m"] = (
+        (df["premium_index_bps"] - df["premium_index_bps"].rolling(60, min_periods=10).mean())
+        / (df["premium_index_bps"].rolling(60, min_periods=10).std() + eps)
+    ).fillna(0.0)
     
-    # 7. TARGET 5-MENIT
-    future_ret_5m = np.log(df["close"].shift(-5) / df["close"])
-    vol_threshold = 0.25 * (df["natr_1m_bps"] / 10000.0)
+    # --------------------------------------------------------------------------
+    # 6. SIKLUS WAKTU TRIGONOMETRI BERPASANGAN (Wajib Sin + Cos Bersama!)
+    # --------------------------------------------------------------------------
+    minute = df.index.minute
+    hour_float = df.index.hour + (minute / 60.0)
     
-    df["target_return_5m"] = future_ret_5m
-    df["target_signal_5m"] = np.where(
-        future_ret_5m > vol_threshold, 1,
-        np.where(future_ret_5m < -vol_threshold, -1, 0)
+    df["min_sin"] = np.sin(2 * np.pi * minute / 60.0)
+    df["min_cos"] = np.cos(2 * np.pi * minute / 60.0)
+    df["hour_sin"] = np.sin(2 * np.pi * hour_float / 24.0)
+    df["hour_cos"] = np.cos(2 * np.pi * hour_float / 24.0)
+    
+    # --------------------------------------------------------------------------
+    # 7. TARGET 5-MENIT AKURAT (ASYMMETRIC PATH-DEPENDENT TRIPLE-BARRIER)
+    # --------------------------------------------------------------------------
+    HORIZON = 5
+    MIN_TP_BPS = 0.0012  # Minimal TP = 12 bps (0.12%) -> Bersih di atas fee 8-10 bps
+    MIN_SL_BPS = 0.0010  # Minimal SL = 10 bps (0.10%) -> Ruang napas anti-noise
+
+    # Gunakan harga Open menit berikutnya (t+1) sebagai harga eksekusi nyata
+    entry_prices = np.roll(df["open"].values, -1)
+    highs = df["high"].values
+    lows = df["low"].values
+    closes = df["close"].values
+
+    # Ekspektasi volatilitas 5 menit berdasarkan NATR 1m
+    vol_5m = (df["natr_1m_bps"].values / 10000.0) * np.sqrt(HORIZON)
+
+    # Jarak TP & Jarak SL
+    tp_dist = np.maximum(MIN_TP_BPS, 0.75 * vol_5m)
+    sl_dist = np.maximum(MIN_SL_BPS, 0.55 * vol_5m)
+
+    # Level harga untuk skenario LONG & SHORT
+    tp_long_level = entry_prices * (1.0 + tp_dist)
+    sl_long_level = entry_prices * (1.0 - sl_dist)
+    tp_short_level = entry_prices * (1.0 - tp_dist)
+    sl_short_level = entry_prices * (1.0 + sl_dist)
+
+    n_rows = len(df)
+    long_tp_step = np.full(n_rows, 99, dtype=np.int8)
+    long_sl_step = np.full(n_rows, 99, dtype=np.int8)
+    short_tp_step = np.full(n_rows, 99, dtype=np.int8)
+    short_sl_step = np.full(n_rows, 99, dtype=np.int8)
+
+    for step in range(1, HORIZON + 1):
+        fut_high = np.roll(highs, -step)
+        fut_low = np.roll(lows, -step)
+
+        # Cek jalur LONG
+        long_tp_step[(fut_high >= tp_long_level) & (long_tp_step == 99)] = step
+        long_sl_step[(fut_low <= sl_long_level) & (long_sl_step == 99)] = step
+
+        # Cek jalur SHORT
+        short_tp_step[(fut_low <= tp_short_level) & (short_tp_step == 99)] = step
+        short_sl_step[(fut_high >= sl_short_level) & (short_sl_step == 99)] = step
+
+    # Validasi kemenangan murni (TP tersentuh duluan sebelum SL dalam <= 5 menit)
+    long_win = (long_tp_step < long_sl_step) & (long_tp_step <= HORIZON)
+    short_win = (short_tp_step < short_sl_step) & (short_tp_step <= HORIZON)
+
+    # Menentukan sinyal final (jika terjadi anomali keduanya True, pilih yang step-nya lebih kecil)
+    long_only = long_win & (~short_win | (long_tp_step <= short_tp_step))
+    short_only = short_win & (~long_win | (short_tp_step < long_tp_step))
+
+    df["target_signal_5m"] = np.where(long_only, 1, np.where(short_only, -1, 0)).astype(np.int8)
+
+    # Realized Return 5m
+    raw_ret_5m = np.log(np.roll(closes, -HORIZON) / (entry_prices + 1e-8))
+    df["target_return_5m"] = np.where(
+        long_only, tp_dist,
+        np.where(short_only, -tp_dist, raw_ret_5m)
     )
-    
-    return df
+
+    # Bersihkan efek wrap-around np.roll pada HORIZON baris terakhir
+    df.iloc[-HORIZON:, df.columns.get_loc("target_return_5m")] = np.nan
+    df.iloc[-HORIZON:, df.columns.get_loc("target_signal_5m")] = 0
 
 # ==============================================================================
 # 3. EKSEKUSI UTAMA & PENYIMPANAN MASSAL
@@ -157,28 +248,58 @@ if __name__ == "__main__":
         # Eksekusi Feature Engineering
         features_df = build_features(combined_raw_df)
         
-        # Susunan kolom PASTI sesuai dengan target akhir (20 Kolom Total)
+        # Susunan Kolom Lengkap (Pasangan Fitur Utuh + Target 3 Kelas)
         target_columns = [
-            "open", "high", "low", "close", "vwap_zscore_4h", "min_cos", 
-            "cvd_zscore_30m", "volume_delta", "natr_1m_bps", "volatility_ratio_5m_60m", 
-            "premium_zscore_60m", "volume_delta_lag1", "min_sin", "hour_sin", 
-            "hour_cos", "lower_wick_ratio", "premium_index_bps", 
-            "target_return_5m", "target_signal_5m"
+            "open",
+            "high",
+            "low",
+            "close",
+            # Pilar 1: Harga, VWAP & Geometri Candle Berpasangan
+            "vwap_zscore_4h",
+            "lower_wick_ratio",
+            "upper_wick_ratio",
+            "wick_imbalance",
+            "clv_imbalance",
+            # Pilar 2: Order Flow & Divergensi Ortogonal
+            "volume_delta",
+            "volume_delta_lag1",
+            "taker_imbalance_ratio",
+            "taker_imbalance_lag1",
+            "cvd_zscore_30m",
+            "flow_price_divergence",
+            # Pilar 3: Derivatif Basis Spot-Perp
+            "premium_index_bps",
+            "premium_zscore_60m",
+            # Pilar 4: Volatilitas & Siklus Waktu Berpasangan (Sin + Cos)
+            "volatility_ratio_5m_60m",
+            "natr_1m_bps",
+            "min_sin",
+            "min_cos",
+            "hour_sin",
+            "hour_cos",
+            # Target Label (Y)
+            "target_return_5m",
+            "target_signal_5m"
         ]
         
         final_df = features_df[target_columns].copy()
         
         # FINAL CLEANING:
-        # 1. Buang 240 baris pertama (Masa warm-up untuk indikator VWAP 4H)
-        # 2. Buang 5 baris terakhir (Karena target_return_5m mengambil masa depan, ujungnya pasti NaN)
         final_df = final_df.iloc[240:-5].dropna(subset=["target_return_5m"])
+        final_df["target_signal_5m"] = final_df["target_signal_5m"].astype(np.int8)
         
-        # Konversi target menjadi integer (-1, 0, 1) agar siap masuk model Classifier
-        final_df["target_signal_5m"] = final_df["target_signal_5m"].astype(int)
+        # Cetak distribusi kelas target (-1, 0, 1) untuk memastikan kelas 0 (WAIT) terbentuk dengan benar
+        class_counts = final_df["target_signal_5m"].value_counts(normalize=True) * 100
+        print("\nDistribusi Kelas Target 5-Menit (Cost-Aware 3-Kelas):")
+        for cls_val, pct in class_counts.items():
+            label_name = "WAIT (Noise/Sideways)" if cls_val == 0 else ("LONG (+1)" if cls_val == 1 else "SHORT (-1)")
+            print(f"  Kelas {cls_val:2d} [{label_name:21s}] : {pct:.2f}% dari total data")
         
-        output_file = "btc_1m_final_13_features.csv"
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        output_file = os.path.join(base_dir, "btc_1m_golden_features.csv")
         final_df.to_csv(output_file, index=True, index_label="timestamp")
         
         print(f"\n[+] Selesai! Golden Dataset bersih ({len(final_df):,} baris) disimpan ke '{output_file}'.")
+        print(f"[+] Daftar Kolom ({len(target_columns) + 1}): {['timestamp'] + target_columns}")
     else:
         print("Tidak ada data yang berhasil dikumpulkan.")
