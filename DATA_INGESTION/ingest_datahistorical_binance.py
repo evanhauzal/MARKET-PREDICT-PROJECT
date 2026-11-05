@@ -212,6 +212,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df.iloc[-HORIZON:, df.columns.get_loc("target_return_5m")] = np.nan
     df.iloc[-HORIZON:, df.columns.get_loc("target_signal_5m")] = 0
 
+    return df
 # ==============================================================================
 # 3. EKSEKUSI UTAMA & PENYIMPANAN MASSAL
 # ==============================================================================
