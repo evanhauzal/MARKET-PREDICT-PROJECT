@@ -5,6 +5,9 @@ import time
 import pandas as pd
 import requests
 from groq import Groq
+from dotenv import load_dotenv
+                                                   
+load_dotenv(os.path.join(os.path.dirname(__file__), "DATA_INGESTION", ".env"))
 
 # ==========================================
 # 1. KONFIGURASI API KEY GROQ & SETUP
@@ -18,7 +21,7 @@ SEEN_IDS_FILE = "seen_tree_news_ids.txt"
 OUTPUT_CSV = "btc_realtime_clean_sentiment.csv"
 
 # Inisialisasi client Groq
-client = Groq(api_key=GROQ_API_KEY)
+client = Groq()
 
 # ==========================================
 # 2. FILTER LOKAL & DEDUPLIKASI CERDAS

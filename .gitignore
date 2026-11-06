@@ -1,2 +1,6 @@
-﻿**/*.csv
+**/*.csv
 .env
+__pycache__/
+*.py[cod]
+seen_tree_news_ids.txt
+
